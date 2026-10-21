@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <cstdlib>
 #include <string>
 
 #include "environ.h"
@@ -10,6 +11,11 @@
 namespace mooncake {
 
 bool BucketBackendConfig::Validate() const {
+    if (read_io_jobs < 0 ||
+        (read_io_jobs > 0 && read_sub_batch_max_iovecs < 4)) {
+        LOG(ERROR) << "BucketBackendConfig: invalid I/O jobs or sub batch size";
+        return false;
+    }
     if (bucket_keys_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
         return false;
@@ -24,6 +30,18 @@ bool BucketBackendConfig::Validate() const {
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     BucketBackendConfig config;
     using Variables = BucketBackendEnvironmentVariables;
+
+    // Unlike legacy limits, invalid explicitly configured I/O controls must
+    // fail validation rather than silently falling back to defaults.
+    const auto read_io = [](const auto& variable, int64_t fallback) {
+        if (!std::getenv(variable.name)) return fallback;
+        return Environ::Read(variable).value_or(-1);
+    };
+    config.read_io_jobs =
+        read_io(Variables::MOONCAKE_OFFLOAD_READ_IO_JOBS, config.read_io_jobs);
+    config.read_sub_batch_max_iovecs =
+        read_io(Variables::MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS,
+                config.read_sub_batch_max_iovecs);
 
     config.bucket_keys_limit =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT,

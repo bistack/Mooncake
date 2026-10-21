@@ -39,6 +39,8 @@ class ScopedEnvVar {
 };
 
 struct BucketBackendEnvironment {
+    ScopedEnvVar read_jobs{"MOONCAKE_OFFLOAD_READ_IO_JOBS"};
+    ScopedEnvVar sub_batch{"MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS"};
     ScopedEnvVar keys_limit{"MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"};
     ScopedEnvVar size_limit{"MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"};
     ScopedEnvVar max_total_size{"MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE"};
@@ -202,6 +204,50 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
     config.max_physical_bytes = -1;
     config.disk_scan_cache_ms = -1;
     EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(BucketBackendConfigTest, IoDefaults) {
+    auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.read_io_jobs, 0);
+    EXPECT_EQ(config.read_sub_batch_max_iovecs, 128);
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(BucketBackendConfigTest, DisabledReadJobsIgnoreSubBatchSize) {
+    env.read_jobs.Set("0");
+    env.sub_batch.Set("0");
+    auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.read_io_jobs, 0);
+    EXPECT_TRUE(config.Validate());
+
+    env.read_jobs.Set("1");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+}
+
+TEST_F(BucketBackendConfigTest, IndependentIoControls) {
+    env.read_jobs.Set("6");
+    env.sub_batch.Set("9");
+    auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.read_io_jobs, 6);
+    EXPECT_EQ(config.read_sub_batch_max_iovecs, 9);
+}
+
+TEST_F(BucketBackendConfigTest, RejectsInvalidExplicitIoControls) {
+    for (const auto* value :
+         {"-1", "", "invalid", "1suffix", "9223372036854775808"}) {
+        env.read_jobs.Set(value);
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate())
+            << value;
+        env.read_jobs.Unset();
+    }
+    env.read_jobs.Set("4");
+    for (const auto* value : {"0", "1", "2", "3", "-1", "", "invalid"}) {
+        env.sub_batch.Set(value);
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate())
+            << value;
+    }
+    env.sub_batch.Set("4");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().Validate());
 }
 
 TEST_F(BucketBackendConfigTest, EachConstructionReadsCurrentEnvironment) {

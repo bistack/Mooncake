@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "batch_io_scheduler.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -1113,6 +1114,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    std::unique_ptr<BatchIoScheduler> read_io_scheduler_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)

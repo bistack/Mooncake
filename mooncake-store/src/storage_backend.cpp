@@ -1514,6 +1514,7 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    if (read_io_scheduler_) read_io_scheduler_->Shutdown();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -1786,8 +1787,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
-    // Step 2: Perform IO without holding any locks
-    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+    auto read_bucket = [&](int64_t bucket_id,
+                           std::span<const ReadPlan> read_plans)
+        -> tl::expected<void, ErrorCode> {
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
@@ -1876,7 +1878,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<char*>(plan.dest_slice.ptr) +
                     batch_plan.offset_in_buffer;
             }
-            continue;
+            return {};
         }
 #endif
 
@@ -1897,10 +1899,38 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
+        return {};
+    };
+
+    // read_io_jobs == 0: preserve the original per-bucket read path on the
+    // calling thread.
+    if (bucket_backend_config_.read_io_jobs == 0) {
+        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto result = read_bucket(bucket_id, read_plans);
+            if (!result) return result;
+        }
+        return {};
     }
 
-    // bucket_guards go out of scope here, decrementing inflight_reads_
-    return {};
+    // read_io_jobs > 0: split each bucket's Slices into sub batches for
+    // parallel reads on the shared worker pool. Each sub batch reads one file.
+    BatchIoScheduler::PendingBatch pending_batch;
+    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        auto execute =
+            [&, bucket_id, read_plans = std::span<const ReadPlan>(read_plans)](
+                size_t slice_idx_begin,
+                size_t slice_idx_end) -> tl::expected<void, ErrorCode> {
+            return read_bucket(
+                bucket_id, read_plans.subspan(slice_idx_begin,
+                                              slice_idx_end - slice_idx_begin));
+        };
+        auto result = read_io_scheduler_->PrepareSubBatches(
+            pending_batch, read_plans.size(),
+            bucket_backend_config_.read_sub_batch_max_iovecs, execute);
+        if (!result) return result;
+    }
+    // Publish only after every bucket has been prepared successfully.
+    return read_io_scheduler_->SubmitAndWait(pending_batch);
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
@@ -1922,6 +1952,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         if (initialized_.load(std::memory_order_acquire)) {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        if (!bucket_backend_config_.Validate()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::unique_ptr<BatchIoScheduler> scheduler;
+        if (bucket_backend_config_.read_io_jobs > 0) {
+            auto result =
+                BatchIoScheduler::Create(bucket_backend_config_.read_io_jobs);
+            if (!result) return tl::make_unexpected(result.error());
+            scheduler = std::move(result.value());
         }
 
         // One live client per storage_path (standalone contract). Fail fast
@@ -2171,6 +2212,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+        read_io_scheduler_ = std::move(scheduler);
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()

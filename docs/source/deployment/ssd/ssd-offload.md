@@ -155,12 +155,30 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `MOONCAKE_OFFLOAD_READ_IO_JOBS` | `0` (disabled) | Number of persistent read workers for Bucket `BatchLoad`. `0` preserves the original caller-thread read path without creating a scheduler; a positive value enables sub-batch scheduling. Negative or malformed values fail backend initialization. |
+| `MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS` | `128` | Regular number of whole logical Slices per sub batch, independently for each bucket file. Effective only when read jobs are enabled; then it must be at least `4`. This counts Slices, not the system call's iovec limit. |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+
+#### Tune Bucket read concurrency
+
+Set the read controls in the **Real Client** environment before starting the embedded application or standalone `mooncake_client`. For a four-drive NVMe RAID0 volume, an initial tuning point is two read workers per member drive:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_READ_IO_JOBS=8
+export MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS=128
+```
+
+The worker count is a tuning starting point; benchmark throughput, tail latency, and CPU usage on the target volume. These controls apply to Bucket reads and leave the existing write path unchanged. They work with the existing POSIX or io_uring file implementation; `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
+
+Sub batches are formed within each bucket file. A final group of at most `floor(sub_batch_size / 4)` Slices joins the previous group: with the default `128`, `160` Slices form one group, while `161` form groups of `128` and `33`. The merged final group can therefore exceed the configured regular size. Different bucket files' tails are never merged.
+
+Leave `MOONCAKE_OFFLOAD_READ_IO_JOBS` unset or set it to `0` to retain the original read path; in that mode, the sub-batch setting is ignored. When jobs are enabled, an invalid sub-batch setting fails backend initialization.
 
 ### File-per-key backend settings
 
