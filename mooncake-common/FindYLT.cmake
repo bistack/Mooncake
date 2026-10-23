@@ -18,22 +18,26 @@ else()
 endif()
 
 set(YLT_COMMIT 7801bc9ad9021781f15217552214e325a1cf7373)
+# Keep verified archives outside build/ so clean builds can reuse them. Docker's
+# COPY also carries a host-populated cache into the build image.
+set(YLT_DOWNLOAD_DIR
+    "${CMAKE_SOURCE_DIR}/.cache/yalantinglibs"
+    CACHE PATH "Directory for cached yalantinglibs archives")
 FetchContent_Declare(
   yalantinglibs
+  DOWNLOAD_DIR "${YLT_DOWNLOAD_DIR}"
   URL ${GH_MIRROR}https://github.com/alibaba/yalantinglibs/archive/${YLT_COMMIT}.tar.gz
-  URL_HASH SHA256=2a4b93c256c09fa84e1507bf4d5b33571ee47a4e2c65316ca255680ad3cdfc1e
-)
+  URL_HASH
+    SHA256=2a4b93c256c09fa84e1507bf4d5b33571ee47a4e2c65316ca255680ad3cdfc1e)
 
 # Exclude from install for CMake before 3.28
 FetchContent_GetProperties(yalantinglibs)
 FetchContent_Populate(yalantinglibs)
-add_subdirectory(
-  ${yalantinglibs_SOURCE_DIR}
-  ${yalantinglibs_BINARY_DIR}
-  EXCLUDE_FROM_ALL
-)
+add_subdirectory(${yalantinglibs_SOURCE_DIR} ${yalantinglibs_BINARY_DIR}
+                 EXCLUDE_FROM_ALL)
 
 # Suppress warnings for CMake before 3.25
 get_target_property(YLT_INCL_DIRS yalantinglibs INTERFACE_INCLUDE_DIRECTORIES)
-set_target_properties(yalantinglibs PROPERTIES
-  INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${YLT_INCL_DIRS}")
+set_target_properties(
+  yalantinglibs PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+                           "${YLT_INCL_DIRS}")

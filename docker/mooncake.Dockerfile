@@ -52,6 +52,10 @@ COPY . /workspace
 # Install Mooncake dependencies (submodules, Go, etc.)
 RUN bash dependencies.sh -y
 
+# Keep CPU/GPU switches after dependency installation so both reuse its cache.
+ARG USE_CUDA=ON
+ARG WITH_EP=ON
+
 # Configure and build the wheel in one layer, then remove build/ only after
 # auditwheel has resolved libraries from it. The large intermediate tree is
 # therefore not retained in the builder image or BuildKit cache.
@@ -61,8 +65,8 @@ RUN mkdir -p build && \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
-        -DUSE_CUDA=ON \
-        -DWITH_EP=ON \
+        -DUSE_CUDA=${USE_CUDA} \
+        -DWITH_EP=${WITH_EP} \
         -DSTORE_USE_ETCD=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
@@ -72,10 +76,12 @@ RUN mkdir -p build && \
     export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
-    cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
-    cd /workspace && \
+    if [ "${USE_CUDA}" = "ON" ]; then \
+        mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
+        cd mooncake-transfer-engine/nvlink-allocator && \
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
+        cd /workspace; \
+    fi && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
@@ -114,9 +120,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    apt-get purge -y --auto-remove software-properties-common curl && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
-    apt-get purge -y --auto-remove software-properties-common curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy wheels produced in builder stage and install them via pip
