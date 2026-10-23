@@ -5283,4 +5283,208 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+TEST_F(StorageBackendTest, ParallelOffloadPlansAreLazyAndRoundTripAllSlices) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 4;
+    bucket_config.write_sub_batch_max_iovecs = 4;
+    bucket_config.read_io_workers = 3;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    BucketStorageBackend::PendingOffloads pending;
+    std::atomic<size_t> loaded{0}, committed{0};
+    std::vector<std::string> payloads(2, std::string(11003, 'a'));
+    payloads[1].assign(11003, 'b');
+    for (size_t b = 0; b < 2; ++b) {
+        BucketStorageBackend::OffloadObjects objects;
+        // Eleven source Slices per bucket: several sub batches share the file.
+        std::vector<Slice> slices;
+        for (size_t i = 0; i < 11; ++i)
+            slices.push_back(
+                {payloads[b].data() + i * 1000, i == 10 ? 1003UL : 1000UL});
+        const auto key = "parallel_" + std::to_string(b);
+        objects.emplace(key, slices);
+        ASSERT_TRUE(backend.PrepareOffload(
+            pending, objects,
+            [&](const auto&, auto&) {
+                ++committed;
+                return ErrorCode::OK;
+            },
+            nullptr,
+            [&, objects]() -> tl::expected<BucketStorageBackend::OffloadObjects,
+                                           ErrorCode> {
+                ++loaded;
+                return objects;
+            }));
+    }
+    EXPECT_EQ(loaded.load(), 0);
+    EXPECT_EQ(committed.load(), 0);
+    EXPECT_EQ(CountDataFiles(data_path), 0);
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(loaded.load(), 2);
+    EXPECT_EQ(committed.load(), 2);
+    std::vector<std::string> output(2, std::string(11003, '\0'));
+    std::unordered_map<std::string, Slice> reads;
+    for (size_t b = 0; b < 2; ++b)
+        reads.emplace("parallel_" + std::to_string(b),
+                      Slice{output[b].data(), output[b].size()});
+    ASSERT_TRUE(backend.BatchLoad(reads));
+    EXPECT_EQ(output, payloads);
+}
+
+TEST_F(StorageBackendTest,
+       ParallelOffloadFailureIsIsolatedAndPreparationIsAtomic) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::string data(4097, 'x');
+    BucketStorageBackend::PendingOffloads pending;
+    std::atomic<size_t> successes{0};
+    auto complete = [&](const auto&, auto&) {
+        ++successes;
+        return ErrorCode::OK;
+    };
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"bad", {{nullptr, data.size()}}}}, complete, nullptr,
+        []() -> tl::expected<BucketStorageBackend::OffloadObjects, ErrorCode> {
+            return tl::make_unexpected(ErrorCode::INVALID_READ);
+        }));
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"good", {{data.data(), data.size()}}}}, complete));
+    EXPECT_FALSE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(successes.load(), 1);
+    ASSERT_TRUE(backend.IsExist("good"));
+    EXPECT_TRUE(*backend.IsExist("good"));
+    EXPECT_FALSE(*backend.IsExist("bad"));
+    // A later preparation failure prevents the earlier valid plan from running.
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"unpublished", {{data.data(), data.size()}}}}, complete));
+    EXPECT_FALSE(backend.PrepareOffload(pending, {}, complete));
+    EXPECT_FALSE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(successes.load(), 1);
+    EXPECT_FALSE(*backend.IsExist("unpublished"));
+}
+
+TEST_F(StorageBackendTest, ParallelOffloadCommitsBeforeAnotherBucketLoads) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    BucketStorageBackend::PendingOffloads pending;
+    std::string value(1001, 'q');
+    BucketStorageBackend::OffloadObjects slow{
+        {"slow", {{value.data(), value.size()}}}};
+    std::promise<void> release, committed;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, slow, nullptr, nullptr,
+        [slow, released]()
+            -> tl::expected<BucketStorageBackend::OffloadObjects, ErrorCode> {
+            released.wait();
+            return slow;
+        }));
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"fast", {{value.data(), value.size()}}}},
+        [&](const auto&, auto&) {
+            committed.set_value();
+            return ErrorCode::OK;
+        }));
+    auto submitted = std::async(std::launch::async, [&] {
+        return backend.SubmitOffloadsAndWait(pending);
+    });
+    const auto ready = committed.get_future().wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(submitted.wait_for(std::chrono::milliseconds(10)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_TRUE(submitted.get());
+}
+
+TEST_F(StorageBackendTest, ParallelOffloadSyncFailureRollsBackAndCanRetry) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    BucketStorageBackend::PendingOffloads pending;
+    std::string value(2001, 'r');
+    size_t completed = 0;
+    auto complete = [&](const auto&, auto&) {
+        ++completed;
+        return ErrorCode::OK;
+    };
+    backend.SetDatasyncFailureForTest(true);
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"retry", {{value.data(), value.size()}}}}, complete));
+    EXPECT_FALSE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(completed, 0);
+    EXPECT_FALSE(*backend.IsExist("retry"));
+    EXPECT_EQ(CountDataFiles(data_path), 0);
+    backend.SetDatasyncFailureForTest(false);
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{"retry", {{value.data(), value.size()}}}}, complete));
+    EXPECT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(completed, 1);
+}
+
+TEST_F(StorageBackendTest, ParallelOffloadReservationsRespectKeyCapacity) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.total_keys_limit = 1;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 1;
+    bucket_config.write_io_workers = 2;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    BucketStorageBackend::PendingOffloads pending;
+    std::string value(1000, 'c');
+    std::atomic<size_t> committed{0};
+    for (const auto* key : {"capacity_a", "capacity_b"}) {
+        ASSERT_TRUE(backend.PrepareOffload(
+            pending, {{key, {{value.data(), value.size()}}}},
+            [&](const auto&, auto&) {
+                ++committed;
+                return ErrorCode::OK;
+            }));
+    }
+    auto result = backend.SubmitOffloadsAndWait(pending);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(committed.load(), 1);
+    EXPECT_EQ(static_cast<int>(*backend.IsExist("capacity_a")) +
+                  static_cast<int>(*backend.IsExist("capacity_b")),
+              1);
+}
+
+TEST_F(StorageBackendTest, ParallelOffloadSplitsPhysicalIovLimit) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    bucket_config.write_sub_batch_max_iovecs = 4096;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    BucketStorageBackend::PendingOffloads pending;
+    const auto limit = ::sysconf(_SC_IOV_MAX);
+    ASSERT_GT(limit, 0);
+    std::string value(static_cast<size_t>(limit) + 17, 'v');
+    std::vector<Slice> slices;
+    for (auto& byte : value) slices.push_back({&byte, 1});
+    ASSERT_TRUE(
+        backend.PrepareOffload(pending, {{"many_iovs", slices}}, nullptr));
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, Slice> read{
+        {"many_iovs", {output.data(), output.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(read));
+    EXPECT_EQ(output, value);
+}
+
 }  // namespace mooncake::test

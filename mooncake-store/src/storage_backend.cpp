@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <utility>
 
 #include <array>
 #include <cctype>
@@ -1514,6 +1516,8 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    write_stopping_.store(true, std::memory_order_release);
+    if (write_io_scheduler_) write_io_scheduler_->Shutdown();
     if (read_io_scheduler_) read_io_scheduler_->Shutdown();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
@@ -1523,6 +1527,296 @@ BucketStorageBackend::~BucketStorageBackend() {
         ::close(owner_lock_fd_);
         owner_lock_fd_ = -1;
     }
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::WaitForReadIdle() const {
+    for (;;) {
+        if (write_stopping_.load(std::memory_order_acquire))
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        if (active_reads_.load(std::memory_order_acquire) == 0) return {};
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            bucket_backend_config_.write_io_backoff_ms));
+    }
+}
+
+// Each plan owns its layout and file. Initialization is lazy, so preparing
+// an entire heartbeat never performs RPC, file I/O or payload staging.
+struct BucketStorageBackend::WritePlan {
+    BucketStorageBackend* backend;
+    int64_t id;
+    OffloadObjects objects;
+    std::shared_ptr<BucketMetadata> bucket;
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<size_t> slice_ends;
+    std::vector<size_t> iov_ends;
+    OffloadSource load_source;
+    OffloadComplete complete;
+    EvictionHandler eviction;
+    std::once_flag initialized;
+    std::optional<ErrorCode> init_error;
+    std::optional<PendingEviction> pending;
+    bool eviction_committed = false;
+    bool committed = false;
+    bool file_created = false;
+    std::unique_ptr<StorageFile> file;
+
+    ~WritePlan() {
+        // Also handles exceptions and a published batch rejected at shutdown.
+        try {
+            file.reset();
+            if (pending) {
+                if (eviction_committed)
+                    backend->ReleasePreparedWrite(*pending);
+                else
+                    backend->RestorePreparedEviction(std::move(*pending));
+            }
+            if (file_created && !committed) backend->CleanupOrphanedBucket(id);
+        } catch (...) {
+            LOG(ERROR) << "Failed to clean offload plan " << id;
+        }
+    }
+};
+
+struct BucketStorageBackend::PendingOffloads::State {
+    BatchIoScheduler::PendingBatch batch;
+    std::optional<ErrorCode> error;
+    BucketStorageBackend* backend = nullptr;
+};
+BucketStorageBackend::PendingOffloads::PendingOffloads()
+    : state_(std::make_unique<State>()) {}
+BucketStorageBackend::PendingOffloads::~PendingOffloads() = default;
+
+tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
+    PendingOffloads& pending, OffloadObjects objects, OffloadComplete complete,
+    EvictionHandler eviction, OffloadSource load_source) {
+    auto& state = *pending.state_;
+    if (state.error) return tl::make_unexpected(*state.error);
+    const auto fail = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+        state.error = error;
+        return tl::make_unexpected(error);
+    };
+    if (!initialized_.load(std::memory_order_acquire) || !write_io_scheduler_ ||
+        (state.backend && state.backend != this)) {
+        return fail(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    state.backend = this;
+    if (objects.empty()) return fail(ErrorCode::INVALID_PARAMS);
+    try {
+        auto plan = std::make_shared<WritePlan>();
+        plan->backend = this;
+        plan->id = bucket_id_generator_->NextId();
+        plan->objects = std::move(objects);
+        plan->load_source = std::move(load_source);
+        plan->complete = std::move(complete);
+        plan->eviction = std::move(eviction);
+        size_t offset = 0;
+        for (const auto& [key, slices] : plan->objects) {
+            if (slices.empty()) return fail(ErrorCode::INVALID_PARAMS);
+            if (key.size() > std::numeric_limits<int64_t>::max() - offset)
+                return fail(ErrorCode::INVALID_PARAMS);
+            offset += key.size();
+            for (const auto& slice : slices) {
+                if (slice.size == 0 || (!slice.ptr && !plan->load_source) ||
+                    slice.size > std::numeric_limits<int64_t>::max() - offset)
+                    return fail(ErrorCode::INVALID_PARAMS);
+                offset += slice.size;
+                plan->slice_ends.push_back(offset);
+            }
+        }
+        auto built =
+            BuildBucket(plan->id, plan->objects, plan->iovs, plan->metadatas);
+        if (!built) return fail(built.error());
+        plan->bucket = std::move(built.value());
+        auto result = write_io_scheduler_->PrepareSubBatches(
+            state.batch, plan->slice_ends.size(),
+            bucket_backend_config_.write_sub_batch_max_iovecs,
+            [this, plan](size_t begin, size_t end) {
+                return ExecuteWriteRange(*plan, begin, end);
+            },
+            [this, plan](tl::expected<void, ErrorCode> result) {
+                return FinishWritePlan(*plan, result);
+            });
+        if (!result) return fail(result.error());
+        return {};
+    } catch (const std::bad_alloc&) {
+        return fail(ErrorCode::NO_AVAILABLE_HANDLE);
+    } catch (...) {
+        return fail(ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::SubmitOffloadsAndWait(
+    PendingOffloads& pending) {
+    std::unique_ptr<PendingOffloads::State> replacement;
+    try {
+        replacement = std::make_unique<PendingOffloads::State>();
+    } catch (const std::bad_alloc&) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    auto state = std::exchange(pending.state_, std::move(replacement));
+    if (state->error) return tl::make_unexpected(*state->error);
+    if (!state->backend) return {};
+    if (state->backend != this || !write_io_scheduler_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    return write_io_scheduler_->SubmitAndWait(state->batch);
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
+    WritePlan& plan) {
+    if (plan.load_source) {
+        auto loaded = plan.load_source();
+        if (!loaded) return tl::make_unexpected(loaded.error());
+        // Keep the original map nodes/order: key iovecs refer to these strings.
+        for (auto& [key, slices] : plan.objects) {
+            auto it = loaded->find(key);
+            if (it == loaded->end() || it->second.size() != slices.size())
+                return tl::make_unexpected(ErrorCode::INVALID_READ);
+            for (size_t i = 0; i < slices.size(); ++i) {
+                if (!it->second[i].ptr || it->second[i].size != slices[i].size)
+                    return tl::make_unexpected(ErrorCode::INVALID_READ);
+            }
+            slices = std::move(it->second);
+        }
+        plan.iovs.clear();
+        plan.metadatas.clear();
+        auto built =
+            BuildBucket(plan.id, plan.objects, plan.iovs, plan.metadatas);
+        if (!built) return tl::make_unexpected(built.error());
+        plan.bucket = std::move(built.value());
+    }
+    size_t end = 0;
+    for (const auto& iov : plan.iovs) {
+        end += iov.iov_len;
+        plan.iov_ends.push_back(end);
+    }
+    auto enabled = IsEnableOffloading();
+    if (!enabled) return tl::make_unexpected(enabled.error());
+    if (!*enabled) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        const auto required = plan.bucket->data_size + plan.bucket->meta_size;
+        if (object_bucket_map_.size() + pending_write_keys_.size() +
+                    plan.objects.size() >
+                static_cast<size_t>(file_storage_config_.total_keys_limit) ||
+            required > file_storage_config_.total_size_limit - total_size_ -
+                           pending_write_size_)
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    auto reserved = PrepareEviction(
+        plan.bucket->data_size + plan.bucket->meta_size, plan.bucket->keys);
+    if (!reserved) return tl::make_unexpected(reserved.error());
+    plan.pending = std::move(*reserved);
+    if (plan.eviction && !plan.pending->keys.empty()) {
+        auto notified = plan.eviction(plan.pending->keys);
+        if (!notified) return notified;
+    }
+    CommitPreparedEviction(*plan.pending);
+    plan.eviction_committed = true;
+    publish_lock.unlock();
+    auto finalized = FinalizeEviction(*plan.pending);
+    if (!finalized)
+        LOG(WARNING) << "Offload eviction cleanup: " << finalized.error();
+    auto path = GetBucketDataPath(plan.id);
+    if (!path) return tl::make_unexpected(path.error());
+    // Existing OpenFile writes are buffered POSIX, even with use_uring set.
+    // Open/truncate once per bucket, never once per sub batch.
+    auto opened = OpenFile(*path, FileMode::Write);
+    if (!opened) return tl::make_unexpected(opened.error());
+    plan.file = std::move(*opened);
+    plan.file_created = true;
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ExecuteWriteRange(
+    WritePlan& plan, size_t begin, size_t end) {
+    std::call_once(plan.initialized, [&] {
+        try {
+            auto result = InitializeWritePlan(plan);
+            if (!result) plan.init_error = result.error();
+        } catch (...) {
+            plan.init_error = ErrorCode::INTERNAL_ERROR;
+        }
+    });
+    if (plan.init_error) return tl::make_unexpected(*plan.init_error);
+    auto ready = WaitForReadIdle();
+    if (!ready) return ready;
+    size_t offset = begin == 0 ? 0 : plan.slice_ends[begin - 1];
+    const size_t limit = plan.slice_ends[end - 1];
+    auto it =
+        std::upper_bound(plan.iov_ends.begin(), plan.iov_ends.end(), offset);
+    size_t index = std::distance(plan.iov_ends.begin(), it);
+    const long system_limit = ::sysconf(_SC_IOV_MAX);
+    const size_t iov_limit =
+        system_limit > 0 ? static_cast<size_t>(system_limit) : 1024;
+    while (offset < limit) {
+        std::vector<iovec> iovs;
+        size_t bytes = 0;
+        for (; index < plan.iovs.size() && iovs.size() < iov_limit; ++index) {
+            const size_t source_begin =
+                index == 0 ? 0 : plan.iov_ends[index - 1];
+            const size_t start = std::max(offset, source_begin);
+            const size_t finish = std::min(limit, plan.iov_ends[index]);
+            if (start >= finish) break;
+            iovs.push_back({static_cast<char*>(plan.iovs[index].iov_base) +
+                                start - source_begin,
+                            finish - start});
+            bytes += finish - start;
+            if (finish == limit) break;
+        }
+        if (iovs.empty()) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        auto written = plan.file->vector_write(
+            iovs.data(), static_cast<int>(iovs.size()), offset);
+        if (!written) return tl::make_unexpected(written.error());
+        if (*written != bytes)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        offset += bytes;
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
+    WritePlan& plan, tl::expected<void, ErrorCode> result) {
+    // Called once, after every data callback has returned, outside queue locks.
+    try {
+        if (result) {
+            result = plan.file->datasync();
+            if (test_datasync_failure_.load(std::memory_order_relaxed))
+                result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (result) result = StoreBucketMetadata(plan.id, plan.bucket);
+        if (result) {
+            auto committed =
+                CommitOffloadedBucket(plan.id, plan.bucket, plan.metadatas,
+                                      *plan.pending, plan.complete);
+            if (committed)
+                plan.committed = true;
+            else
+                result = tl::make_unexpected(committed.error());
+        }
+    } catch (...) {
+        result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!result && plan.file_created) {
+        // Handles callback exceptions as well as ordinary write failures.
+        RollbackCommittedBucket(plan.id, plan.bucket->keys);
+    }
+    plan.file.reset();
+    if (plan.pending) {
+        if (plan.eviction_committed)
+            ReleasePreparedWrite(*plan.pending);
+        else
+            RestorePreparedEviction(std::move(*plan.pending));
+        plan.pending.reset();
+    }
+    if (!plan.committed && plan.file_created) CleanupOrphanedBucket(plan.id);
+    plan.file_created = false;
+    // Source loader owns device staging. Release it at this bucket's terminal
+    // state, not after the slowest bucket of the heartbeat finishes.
+    plan.load_source = {};
+    return result;
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
@@ -1541,6 +1835,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
+    auto ready = WaitForReadIdle();
+    if (!ready) return tl::make_unexpected(ready.error());
     auto enable_offloading_res = IsEnableOffloading();
     if (!enable_offloading_res) {
         return tl::make_unexpected(enable_offloading_res.error());
@@ -1562,6 +1858,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
     const int64_t required_size = bucket->data_size + bucket->meta_size;
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
     auto prepare_result = PrepareEviction(required_size, bucket->keys);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
@@ -1577,6 +1874,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     CommitPreparedEviction(pending);
+    publish_lock.unlock();
 
     // Phase 2: delete evicted files NOW, before writing the new bucket, so
     // that the freed disk space is available for the incoming write.
@@ -1595,6 +1893,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(write_bucket_result.error());
     }
     VLOG(1) << "Written bucket with id: " << bucket_id;
+    return CommitOffloadedBucket(bucket_id, std::move(bucket), metadatas,
+                                 pending, complete_handler);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
+    int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket,
+    std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
+    const OffloadComplete& complete_handler) {
+    std::lock_guard<std::mutex> publish_lock(offload_publish_mutex_);
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
@@ -1612,6 +1919,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         SharedMutexLocker lock(&mutex_);
 
         ReleasePreparedWriteLocked(pending);
+        pending.write_size = 0;
+        pending.write_keys.clear();
 
         // Duplicate safety net under mutex_: skip keys that PrepareEviction
         // flagged as already persisted or in flight, plus anything that got
@@ -1716,6 +2025,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    struct ReadActivity {
+        std::atomic<size_t>& count;
+        explicit ReadActivity(std::atomic<size_t>& c) : count(c) { ++count; }
+        ~ReadActivity() { --count; }
+    } activity(active_reads_);
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1902,9 +2216,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         return {};
     };
 
-    // read_io_jobs == 0: preserve the original per-bucket read path on the
+    // read_io_workers == 0: preserve the original per-bucket read path on the
     // calling thread.
-    if (bucket_backend_config_.read_io_jobs == 0) {
+    if (bucket_backend_config_.read_io_workers == 0) {
         for (auto& [bucket_id, read_plans] : bucket_read_plans) {
             auto result = read_bucket(bucket_id, read_plans);
             if (!result) return result;
@@ -1912,7 +2226,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         return {};
     }
 
-    // read_io_jobs > 0: split each bucket's Slices into sub batches for
+    // read_io_workers > 0: split each bucket's Slices into sub batches for
     // parallel reads on the shared worker pool. Each sub batch reads one file.
     BatchIoScheduler::PendingBatch pending_batch;
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
@@ -1958,9 +2272,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         std::unique_ptr<BatchIoScheduler> scheduler;
-        if (bucket_backend_config_.read_io_jobs > 0) {
+        if (bucket_backend_config_.read_io_workers > 0) {
             auto result =
-                BatchIoScheduler::Create(bucket_backend_config_.read_io_jobs);
+                BatchIoScheduler::Create(bucket_backend_config_.read_io_workers);
             if (!result) return tl::make_unexpected(result.error());
             scheduler = std::move(result.value());
         }
@@ -2211,6 +2525,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         } else {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
+        }
+        if (bucket_backend_config_.write_io_workers > 0) {
+            auto writer = BatchIoScheduler::Create(
+                bucket_backend_config_.write_io_workers,
+                [this] {
+                    return active_reads_.load(std::memory_order_acquire) == 0;
+                },
+                std::chrono::milliseconds(
+                    bucket_backend_config_.write_io_backoff_ms));
+            if (!writer) return tl::make_unexpected(writer.error());
+            write_io_scheduler_ = std::move(writer.value());
         }
         read_io_scheduler_ = std::move(scheduler);
         initialized_.store(true, std::memory_order_release);
@@ -3234,6 +3559,7 @@ BucketStorageBackend::EvictAboveDiskWatermark(
     const auto target_total_size =
         static_cast<int64_t>(max_total_size * low_watermark_ratio);
     const auto synthetic_required_size = max_total_size - target_total_size;
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
     auto prepare_result = PrepareEviction(synthetic_required_size);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
@@ -3249,6 +3575,7 @@ BucketStorageBackend::EvictAboveDiskWatermark(
         }
     }
     CommitPreparedEviction(pending);
+    publish_lock.unlock();
     auto finalize_result = FinalizeEviction(pending);
     if (!finalize_result) {
         LOG(ERROR)

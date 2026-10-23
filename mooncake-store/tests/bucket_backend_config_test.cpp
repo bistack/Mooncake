@@ -39,7 +39,10 @@ class ScopedEnvVar {
 };
 
 struct BucketBackendEnvironment {
-    ScopedEnvVar read_jobs{"MOONCAKE_OFFLOAD_READ_IO_JOBS"};
+    ScopedEnvVar read_jobs{"MOONCAKE_OFFLOAD_READ_IO_WORKERS"};
+    ScopedEnvVar write_workers{"MOONCAKE_OFFLOAD_WRITE_IO_WORKERS"};
+    ScopedEnvVar write_sub_batch{"MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS"};
+    ScopedEnvVar write_backoff{"MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS"};
     ScopedEnvVar sub_batch{"MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS"};
     ScopedEnvVar keys_limit{"MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"};
     ScopedEnvVar size_limit{"MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"};
@@ -208,7 +211,7 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
 
 TEST_F(BucketBackendConfigTest, IoDefaults) {
     auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.read_io_jobs, 0);
+    EXPECT_EQ(config.read_io_workers, 0);
     EXPECT_EQ(config.read_sub_batch_max_iovecs, 128);
     EXPECT_TRUE(config.Validate());
 }
@@ -217,7 +220,7 @@ TEST_F(BucketBackendConfigTest, DisabledReadJobsIgnoreSubBatchSize) {
     env.read_jobs.Set("0");
     env.sub_batch.Set("0");
     auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.read_io_jobs, 0);
+    EXPECT_EQ(config.read_io_workers, 0);
     EXPECT_TRUE(config.Validate());
 
     env.read_jobs.Set("1");
@@ -228,7 +231,7 @@ TEST_F(BucketBackendConfigTest, IndependentIoControls) {
     env.read_jobs.Set("6");
     env.sub_batch.Set("9");
     auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.read_io_jobs, 6);
+    EXPECT_EQ(config.read_io_workers, 6);
     EXPECT_EQ(config.read_sub_batch_max_iovecs, 9);
 }
 
@@ -248,6 +251,34 @@ TEST_F(BucketBackendConfigTest, RejectsInvalidExplicitIoControls) {
     }
     env.sub_batch.Set("4");
     EXPECT_TRUE(BucketBackendConfig::FromEnvironment().Validate());
+}
+
+TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
+    auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.write_io_workers, 0);
+    EXPECT_EQ(config.write_sub_batch_max_iovecs, 128);
+    EXPECT_EQ(config.write_io_backoff_ms, 300);
+    env.write_sub_batch.Set("0");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().Validate());
+    env.write_workers.Set("3");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+    env.write_sub_batch.Set("9");
+    env.write_backoff.Set("17");
+    config = BucketBackendConfig::FromEnvironment();
+    EXPECT_TRUE(config.Validate());
+    EXPECT_EQ(config.read_io_workers, 0);
+    EXPECT_EQ(config.write_io_workers, 3);
+    EXPECT_EQ(config.write_sub_batch_max_iovecs, 9);
+    EXPECT_EQ(config.write_io_backoff_ms, 17);
+    for (const auto* bad : {"-1", "", "invalid", "9223372036854775808"}) {
+        env.write_workers.Set(bad);
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+    }
+    env.write_workers.Set("0");
+    for (const auto* bad : {"0", "-1", "invalid"}) {
+        env.write_backoff.Set(bad);
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+    }
 }
 
 TEST_F(BucketBackendConfigTest, EachConstructionReadsCurrentEnvironment) {

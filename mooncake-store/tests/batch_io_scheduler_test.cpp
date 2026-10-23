@@ -426,5 +426,119 @@ TEST(BatchIoSchedulerTest, ShutdownWaitsForRunningTaskAndRejectsNewWork) {
     scheduler.Shutdown();
 }
 
+TEST(BatchIoSchedulerTest, FailedWriteGroupDoesNotCancelOtherBuckets) {
+    auto created = BatchIoScheduler::Create(1);
+    ASSERT_TRUE(created);
+    auto& scheduler = *created.value();
+    BatchIoScheduler::PendingBatch batch;
+    size_t bad_calls = 0, good_calls = 0, finished = 0;
+    ASSERT_TRUE(scheduler.PrepareSubBatches(
+        batch, 12, 4,
+        [&](size_t, size_t) -> IoResult {
+            ++bad_calls;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        },
+        [&](IoResult result) -> IoResult {
+            EXPECT_FALSE(result);
+            ++finished;
+            return result;
+        }));
+    ASSERT_TRUE(scheduler.PrepareSubBatches(
+        batch, 12, 4,
+        [&](size_t, size_t) -> IoResult {
+            ++good_calls;
+            return {};
+        },
+        [&](IoResult result) -> IoResult {
+            EXPECT_TRUE(result);
+            ++finished;
+            return result;
+        }));
+    ExpectError(scheduler.SubmitAndWait(batch), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(bad_calls, 1);
+    EXPECT_EQ(good_calls, 3);
+    EXPECT_EQ(finished, 2);
+}
+
+TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
+    auto created = BatchIoScheduler::Create(2);
+    ASSERT_TRUE(created);
+    BatchIoScheduler::PendingBatch batch;
+    std::promise<void> finalizer_started, release;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(created.value()->PrepareSubBatches(
+        batch, 4, 4, Succeed, [&](IoResult result) -> IoResult {
+            finalizer_started.set_value();
+            released.wait();
+            return result;
+        }));
+    auto submitted = std::async(std::launch::async, [&] {
+        return created.value()->SubmitAndWait(batch);
+    });
+    const auto ready = finalizer_started.get_future().wait_for(2s);
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(submitted.wait_for(20ms), std::future_status::timeout);
+    release.set_value();
+    EXPECT_TRUE(submitted.get());
+}
+
+TEST(BatchIoSchedulerTest, ReadBusyBackoffRechecksAndShutdownDrainsGroups) {
+    std::atomic<bool> busy{true};
+    std::atomic<size_t> checked{0}, called{0}, finished{0};
+    auto created = BatchIoScheduler::Create(
+        2,
+        [&] {
+            ++checked;
+            return !busy.load();
+        },
+        5ms);
+    ASSERT_TRUE(created);
+    BatchIoScheduler::PendingBatch batch;
+    ASSERT_TRUE(created.value()->PrepareSubBatches(
+        batch, 12, 4,
+        [&](size_t, size_t) -> IoResult {
+            ++called;
+            return {};
+        },
+        [&](IoResult result) -> IoResult {
+            ++finished;
+            return result;
+        }));
+    auto submitted = std::async(std::launch::async, [&] {
+        return created.value()->SubmitAndWait(batch);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (checked.load() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_GE(checked.load(), 2);
+    EXPECT_EQ(called.load(), 0);
+    EXPECT_EQ(submitted.wait_for(20ms), std::future_status::timeout);
+    busy = false;
+    EXPECT_TRUE(submitted.get());
+    EXPECT_EQ(called.load(), 3);
+    EXPECT_EQ(finished.load(), 1);
+
+    busy = true;
+    BatchIoScheduler::PendingBatch cancelled;
+    ASSERT_TRUE(created.value()->PrepareSubBatches(
+        cancelled, 12, 4,
+        [&](size_t, size_t) -> IoResult {
+            ++called;
+            return {};
+        },
+        [&](IoResult result) -> IoResult {
+            ++finished;
+            return result;
+        }));
+    auto pending = std::async(std::launch::async, [&] {
+        return created.value()->SubmitAndWait(cancelled);
+    });
+    // Either rejection before publication or cancellation after publication is
+    // valid. Neither may execute I/O or strand SubmitAndWait.
+    created.value()->Shutdown();
+    ExpectError(pending.get(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(called.load(), 3);
+}
+
 }  // namespace
 }  // namespace mooncake
