@@ -2273,8 +2273,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         }
         std::unique_ptr<BatchIoScheduler> scheduler;
         if (bucket_backend_config_.read_io_workers > 0) {
-            auto result =
-                BatchIoScheduler::Create(bucket_backend_config_.read_io_workers);
+            auto result = BatchIoScheduler::Create(
+                bucket_backend_config_.read_io_workers, {},
+                std::chrono::milliseconds(300), "mc-ssd-r");
             if (!result) return tl::make_unexpected(result.error());
             scheduler = std::move(result.value());
         }
@@ -2533,7 +2534,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     return active_reads_.load(std::memory_order_acquire) == 0;
                 },
                 std::chrono::milliseconds(
-                    bucket_backend_config_.write_io_backoff_ms));
+                    bucket_backend_config_.write_io_backoff_ms),
+                "mc-ssd-w");
             if (!writer) return tl::make_unexpected(writer.error());
             write_io_scheduler_ = std::move(writer.value());
         }

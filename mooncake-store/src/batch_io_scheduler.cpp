@@ -2,13 +2,24 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <glog/logging.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace mooncake {
 
@@ -30,13 +41,39 @@ class BatchIoScheduler::Impl {
         std::shared_ptr<Group> group;
     };
     tl::expected<void, ErrorCode> Init(size_t workers, Ready ready,
-                                       std::chrono::milliseconds backoff) {
+                                       std::chrono::milliseconds backoff,
+                                       std::string_view worker_name_prefix) {
         ready_ = std::move(ready);
         backoff_ = backoff;
         try {
             workers_.resize(workers);
-            for (auto& worker : workers_) {
-                worker = std::thread([this] { Work(); });
+            for (size_t i = 0; i < workers; ++i) {
+                auto name = std::string(worker_name_prefix) + std::to_string(i);
+                // Linux thread names include a terminating NUL in 16 bytes.
+                if (name.size() > 15) name.resize(15);
+                workers_[i] =
+                    std::thread([this, i, workers, name = std::move(name)] {
+#if defined(__linux__)
+                        const int error =
+                            pthread_setname_np(pthread_self(), name.c_str());
+                        const auto tid = ::syscall(SYS_gettid);
+#elif defined(__APPLE__)
+                        const int error = pthread_setname_np(name.c_str());
+                        const auto tid = std::this_thread::get_id();
+#else
+                        const int error = 0;
+                        const auto tid = std::this_thread::get_id();
+#endif
+                        if (error != 0) {
+                            LOG(WARNING)
+                                << "Failed to name I/O worker: name=" << name
+                                << " error=" << std::strerror(error);
+                        }
+                        LOG(INFO) << "I/O worker started: name=" << name
+                                  << " worker_index=" << i
+                                  << " workers=" << workers << " tid=" << tid;
+                        Work();
+                    });
             }
         } catch (...) {
             Shutdown();
@@ -167,12 +204,14 @@ class BatchIoScheduler::Impl {
 
 tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode>
 BatchIoScheduler::Create(size_t workers, Ready ready,
-                         std::chrono::milliseconds backoff) {
+                         std::chrono::milliseconds backoff,
+                         std::string_view worker_name_prefix) {
     if (workers == 0 || backoff.count() <= 0)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     try {
         auto impl = std::make_unique<Impl>();
-        auto result = impl->Init(workers, std::move(ready), backoff);
+        auto result =
+            impl->Init(workers, std::move(ready), backoff, worker_name_prefix);
         if (!result) return tl::make_unexpected(result.error());
         return std::unique_ptr<BatchIoScheduler>(
             new BatchIoScheduler(std::move(impl)));

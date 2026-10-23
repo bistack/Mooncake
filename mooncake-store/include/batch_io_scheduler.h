@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -29,7 +30,8 @@ class BatchIoScheduler {
     // failure.
     static tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode> Create(
         size_t workers, Ready ready = {},
-        std::chrono::milliseconds backoff = std::chrono::milliseconds(300));
+        std::chrono::milliseconds backoff = std::chrono::milliseconds(300),
+        std::string_view worker_name_prefix = "mc-io-");
     ~BatchIoScheduler();
     BatchIoScheduler(const BatchIoScheduler&) = delete;
     BatchIoScheduler& operator=(const BatchIoScheduler&) = delete;

@@ -4,14 +4,20 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <limits>
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 namespace mooncake {
 
@@ -37,6 +43,36 @@ IoResult PrepareAndWait(BatchIoScheduler& scheduler, size_t slice_count,
     if (!result) return result;
     return scheduler.SubmitAndWait(batch);
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+TEST(BatchIoSchedulerTest, NamedWorkersExecuteConcurrently) {
+    auto created = BatchIoScheduler::Create(8, {}, 300ms, "test-wio-");
+    ASSERT_TRUE(created);
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::set<std::string> names;
+    size_t arrived = 0;
+    auto execute = [&](size_t, size_t) -> IoResult {
+        char name[16]{};
+        if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        names.emplace(name);
+        ++arrived;
+        changed.notify_all();
+        if (!changed.wait_for(lock, 5s, [&] { return arrived == 8; })) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return {};
+    };
+    ASSERT_TRUE(PrepareAndWait(*created.value(), 32, 4, execute));
+    EXPECT_EQ(names.size(), 8);
+    for (size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(names.count("test-wio-" + std::to_string(i)), 1);
+    }
+}
+#endif
 
 TEST(BatchIoSchedulerTest, PreparationDefersExecutionUntilSubmission) {
     auto created = BatchIoScheduler::Create(1);
