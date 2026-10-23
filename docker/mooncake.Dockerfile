@@ -6,7 +6,7 @@
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build-deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -14,15 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
-ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.14.0"
-ARG TORCH_CUDA_ARCH_LIST=""
-# CI can opt in to removing /workspace/build from the builder layer.
-ARG CLEAN_BUILD_ARTIFACTS=0
-
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    EP_TORCH_VERSIONS=${EP_TORCH_VERSIONS} \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
@@ -47,14 +39,26 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
+COPY dependencies.sh /workspace/dependencies.sh
+
+# Source changes must not invalidate system package and Go installation.
+RUN bash dependencies.sh -y --skip-submodules
+
+FROM build-deps AS source
 COPY . /workspace
+RUN git submodule sync --recursive && git submodule update --init --recursive
 
-# Install Mooncake dependencies (submodules, Go, etc.)
-RUN bash dependencies.sh -y
-
-# Keep CPU/GPU switches after dependency installation so both reuse its cache.
+FROM source AS builder
+ARG CMAKE_BUILD_TYPE=Release
+ARG EP_TORCH_VERSIONS="2.14.0"
+ARG TORCH_CUDA_ARCH_LIST=""
 ARG USE_CUDA=ON
 ARG WITH_EP=ON
+# CI can opt in to removing /workspace/build from the builder layer.
+ARG CLEAN_BUILD_ARTIFACTS=0
+
+ENV EP_TORCH_VERSIONS=${EP_TORCH_VERSIONS} \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 # Configure and build the wheel in one layer, then remove build/ only after
 # auditwheel has resolved libraries from it. The large intermediate tree is
